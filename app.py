@@ -1,9 +1,9 @@
 import os
 import threading
-from flask import Flask, request
+import logging
+from flask import Flask, request, jsonify
 from telegram import Bot, Update
 from telegram.ext import Updater, CommandHandler
-import logging
 
 # Configuração de logs (opcional, mas útil para debug)
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +19,16 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # opcional
 if not TELEGRAM_TOKEN:
     logger.error("❌ TELEGRAM_TOKEN não configurado")
     raise SystemExit("Defina TELEGRAM_TOKEN nas variáveis de ambiente do Render")
+
+# --- Verificação do imghdr (pode ser imghdr-py no requirements) ---
+try:
+    import imghdr  # noqa: E402
+except ModuleNotFoundError:
+    IMGHDR_AVAILABLE = False
+    logger.error("❌ imghdr NÃO encontrado. Verifique se 'imghdr-py' está no requirements.txt")
+else:
+    IMGHDR_AVAILABLE = True
+    logger.info("✅ imghdr importado com sucesso.")
 
 # Configura o bot do Telegram
 updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
@@ -50,6 +60,17 @@ threading.Thread(target=start_bot, daemon=True).start()
 @app.route("/", methods=["GET"])
 def home():
     return "EV-Radar está rodando corretamente! ✅", 200
+
+# Endpoint para checar se imghdr está disponível
+@app.route("/check-imghdr", methods=["GET"])
+def check_imghdr():
+    """
+    Retorna JSON indicando se o módulo imghdr está presente no ambiente.
+    Use isso para checar rapidamente no Render.
+    """
+    return jsonify({
+        "imghdr_available": IMGHDR_AVAILABLE
+    }), 200 if IMGHDR_AVAILABLE else 500
 
 # Inicia o servidor Flask na porta do Render
 if __name__ == "__main__":
