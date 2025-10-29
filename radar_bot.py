@@ -1,170 +1,251 @@
+#!/usr/bin/env python3
 # radar_bot.py
-# Bot para monitorar partidas e enviar alertas EV+ via Telegram
-# Feito para deploy automático no Render.com
+# EV-Radar global — envia alertas Telegram / salva radar_ev.csv
+# Modo demo padrão: roda com dados de exemplo. Para produção, implemente fetch_live_matches_prod().
 
 import os
+import sys
+import csv
 import time
-import requests
 import json
 import logging
-from bs4 import BeautifulSoup
-from urllib.parse import quote_plus
+from datetime import datetime
+from typing import List, Dict, Any
+import requests
 
-# -----------------------
-# CONFIGURAÇÕES BÁSICAS
-# -----------------------
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN')
-TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
+# ---------------------------
+# CONFIG / ENV
+# ---------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+EV_THRESHOLD = int(os.getenv("EV_THRESHOLD", "65"))   # score >= this -> alert
+ODD_MIN = float(os.getenv("ODD_MIN", "1.50"))        # odd mínima aceitável
+MAX_GAMES = int(os.getenv("MAX_GAMES", "10"))
+MODE = os.getenv("MODE", "DEMO").upper()  # DEMO or PROD
 
-POLL_INTERVAL = int(os.environ.get('POLL_INTERVAL', '60'))  # tempo entre verificações (segundos)
-EV_THRESHOLD = float(os.environ.get('EV_THRESHOLD', '0.02'))  # valor mínimo de EV para alerta
-CMD_MIN = float(os.environ.get('CMD_MIN', '0.95'))  # confiança emocional mínima
-FALLBACK_ODD = float(os.environ.get('FALLBACK_ODD', '1.50'))
+HEADERS = {"User-Agent": "EVRadarBot/1.0 (+https://your.project)"}
 
-MONITORED_LEAGUES = os.environ.get('MONITORED_LEAGUES',
-    'Premier League,La Liga,Serie A,Bundesliga,Ligue 1,Championship,Brazil Serie A,Serie B').split(',')
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger("ev-radar")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; EVRadarBot/1.0)"}
-
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
-log = logging.getLogger("EVRadar")
-
-# -----------------------
-# TELEGRAM
-# -----------------------
-def send_telegram_message(text, url=None):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log.error("Faltam TG_BOT_TOKEN ou TG_CHAT_ID.")
-        return
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": False
-    }
-    if url:
-        payload["reply_markup"] = json.dumps({
-            "inline_keyboard": [[{"text": "Abrir partida", "url": url}]]
-        })
-    r = requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage", data=payload)
-    if r.status_code != 200:
-        log.error("Erro Telegram: %s", r.text)
-
-# -----------------------
-# COLETA DE DADOS
-# -----------------------
-def get_live_matches():
-    """Obtém partidas ao vivo do SofaScore"""
-    url = "https://www.sofascore.com/football/live"
+# ---------------------------
+# UTIL: Telegram
+# ---------------------------
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("TELEGRAM_TOKEN/CHAT_ID not set — skipping Telegram send")
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        matches = []
-        for item in soup.select(".event-row")[:50]:
-            league = item.select_one(".event-league, .tournament-name")
-            teams = item.select(".team-name")
-            score = item.select_one(".current-result")
-            minute = item.select_one(".minute, .status")
-            link = item.find("a", href=True)
-            if not teams or len(teams) < 2:
-                continue
-            matches.append({
-                "league": league.get_text(strip=True) if league else "",
-                "home": teams[0].get_text(strip=True),
-                "away": teams[1].get_text(strip=True),
-                "score": score.get_text(strip=True) if score else "0–0",
-                "minute": minute.get_text(strip=True) if minute else "",
-                "url": f"https://www.sofascore.com{link['href']}" if link else ""
-            })
-        return matches
+        r = requests.post(url, data=payload, timeout=15)
+        r.raise_for_status()
+        logger.info("Telegram message sent")
+        return True
     except Exception as e:
-        log.error("Erro ao buscar partidas: %s", e)
-        return []
+        logger.exception("Error sending Telegram message: %s", e)
+        return False
 
-def get_superbet_odds(home, away):
-    """Busca cotação over no Superbet"""
-    query = quote_plus(f"{home} {away}")
-    url = f"https://www.superbet.com.br/search?query={query}"
+# ---------------------------
+# HELPERS: CSV save
+# ---------------------------
+def save_csv(rows: List[Dict[str, Any]], path: str = "radar_ev.csv") -> None:
+    header = [
+        "league","home","away","minute","score",
+        "xg_total","sot","pressure","odds_over25","liquidity",
+        "ev_score","decision","suggestion","timestamp"
+    ]
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "lxml")
-        odd = soup.select_one(".odd, .odds__value")
-        if odd:
-            val = odd.get_text(strip=True).replace(",", ".")
-            return float(val)
+        with open(path, "w", newline='', encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow({k: r.get(k,"") for k in header})
+        logger.info("Saved CSV: %s (%d rows)", path, len(rows))
+    except Exception as e:
+        logger.exception("Failed to save CSV: %s", e)
+
+# ---------------------------
+# EV model (replace weights with your tuned params)
+# ---------------------------
+def compute_ev_score(match: Dict[str, Any]) -> int:
+    """
+    Simple EV scoring combining multiple signals.
+    Returns integer 0..100.
+    """
+    score = 0.0
+    pressure = float(match.get("pressure", 50))  # 0..100
+    xg = float(match.get("xg_total", 0.0))
+    sot = float(match.get("sot", 0))
+    liquidity = float(match.get("liquidity", 0))
+
+    # Pressure -> up to 20 points
+    score += (pressure / 100.0) * 20.0
+
+    # xG mapping (0..3) -> up to 30 points
+    score += min(xg / 3.0, 1.0) * 30.0
+
+    # SOT (shots on target) -> up to 20 points (10 SOT => full)
+    score += min(sot / 10.0, 1.0) * 20.0
+
+    # Liquidity proxy bonus: scale small bonus so high-liquidity matches prioritized
+    # liquidity given in currency units — we normalize roughly (caps at +10)
+    try:
+        score += min(liquidity / 3_000_000.0, 1.0) * 10.0
     except Exception:
         pass
-    return None
 
-# -----------------------
-# MODELO SIMPLES DE EV
-# -----------------------
-def calc_p_model(match):
-    # Modelo simplificado (será aprimorado conforme base cresce)
-    minute = 0
-    try:
-        minute = int(''.join(filter(str.isdigit, match.get("minute", "0"))))
-    except:
-        pass
-    base = 0.55
-    if minute >= 70:
-        base += 0.05
-    if "cup" in match["league"].lower() or "libertadores" in match["league"].lower():
-        base += 0.05
-    if "0–0" in match["score"]:
-        base -= 0.1
-    elif "1–1" in match["score"] or "2–2" in match["score"]:
-        base += 0.03
-    return min(max(base, 0.01), 0.99)
+    # Context (placeholder fixed bonuses — swap for real checks)
+    # Example: motivation/home trailing; here simple static bonuses to reflect our heuristics
+    score += 6.0  # need/importance
+    score += 4.0  # historical tendency (should be replaced by real history)
 
-def calc_ev(p_model, odd):
-    return p_model * (odd - 1) - (1 - p_model)
+    # Clamp and return integer
+    score = max(0.0, min(100.0, score))
+    return int(round(score))
 
-# -----------------------
-# LOOP PRINCIPAL
-# -----------------------
+# ---------------------------
+# Decision logic
+# ---------------------------
+def decide_action(match: Dict[str, Any], ev_score: int) -> Dict[str,str]:
+    dec = "IGNORAR"
+    suggestion = "Sem stake"
+    if ev_score >= EV_THRESHOLD and float(match.get("odds_over25", 99)) >= ODD_MIN:
+        dec = "ENTRAR"
+        suggestion = "Stake 1% (ajustar conforme banca)"
+    elif 55 <= ev_score < EV_THRESHOLD:
+        dec = "MONITORAR"
+        suggestion = "Aguardar confirmação"
+    else:
+        dec = "IGNORAR"
+        suggestion = "Sem stake"
+    return {"decision": dec, "suggestion": suggestion}
+
+# ---------------------------
+# Message builder (minimalist visual)
+# ---------------------------
+def build_message(match: Dict[str,Any]) -> str:
+    league = match.get("league","")
+    home = match.get("home","")
+    away = match.get("away","")
+    minute = match.get("minute","")
+    score = match.get("score","")
+    xg = match.get("xg_total",0.0)
+    sot = match.get("sot",0)
+    pressure = match.get("pressure",0)
+    odds = match.get("odds_over25","N/A")
+    liquidity = match.get("liquidity",0)
+    ev = match.get("ev_score",0)
+    decision = match.get("decision","")
+    suggestion = match.get("suggestion","")
+
+    lines = []
+    lines.append("══════════ ⚽️ EV+ GLOBAL RADAR ══════════")
+    lines.append(f"{league} — {home} {score} {away} | {minute}’")
+    lines.append(f"xG: {float(xg):.2f} | SOT: {sot} | Pressão: {pressure}%")
+    lines.append(f"Odd Over2.5: {odds} | Liquidez: £{int(liquidity):,}")
+    lines.append(f"SCORE EV+: {ev}/100 — {decision}")
+    lines.append(f"👉 Sugestão: {suggestion}")
+    lines.append("════════════════════════════════════════")
+    return "\n".join(lines)
+
+# ---------------------------
+# DATA PROVIDERS
+# ---------------------------
+def fetch_live_matches_demo() -> List[Dict[str,Any]]:
+    """Returns demo static list (useful for testing)."""
+    demo = [
+        {"id":"m1","league":"Serie A","home":"Inter","away":"Fiorentina","minute":65,"score":"1-0",
+         "xg_total":1.85,"sot":8,"pressure":74,"odds_over25":1.82,"liquidity":2900000},
+        {"id":"m2","league":"Ligue 1","home":"Marseille","away":"Angers","minute":74,"score":"2-1",
+         "xg_total":1.52,"sot":8,"pressure":77,"odds_over25":1.50,"liquidity":2300000},
+        {"id":"m3","league":"Premier League","home":"Liverpool","away":"Chelsea","minute":78,"score":"2-1",
+         "xg_total":3.05,"sot":12,"pressure":79,"odds_over25":1.44,"liquidity":4200000},
+        # add up to MAX_GAMES demo rows
+    ]
+    return demo[:MAX_GAMES]
+
+# NOTE: Below is a placeholder function signature for production fetching.
+# Implement a real scraper or API client and return the same structure as DEMO.
+def fetch_live_matches_prod() -> List[Dict[str,Any]]:
+    """
+    PRODUCTION: implement your Sofascore/Flashscore/odds provider integration here.
+    Important fields to return per match:
+      - id, league, home, away, minute, score
+      - xg_total (float), sot (int), pressure (0..100)
+      - odds_over25 (float), liquidity (numeric)
+    Example approaches:
+      - Call a public JSON endpoint (some sites expose /api/ endpoints) and parse fields.
+      - Scrape the live match page with requests + BeautifulSoup (use lxml parser).
+      - Use an odds API or aggregator to fetch odds and liquidity (requires accounts).
+    """
+    # >>> EXAMPLE: pseudo-code (do not run)
+    # resp = requests.get("https://api.sofascore.com/api/v1/..." , headers=HEADERS, timeout=10)
+    # data = resp.json()
+    # parse data into list of match dicts...
+    raise NotImplementedError("Implement fetch_live_matches_prod() with your data source")
+
+# ---------------------------
+# MAIN
+# ---------------------------
 def main():
-    sent = set()
-    while True:
-        log.info("Buscando partidas ao vivo...")
-        matches = get_live_matches()
-        log.info("Encontradas: %d partidas", len(matches))
-        for m in matches:
-            # filtrar ligas
-            if not any(l.lower().strip() in m["league"].lower() for l in MONITORED_LEAGUES):
-                continue
-            # minuto de interesse
+    logger.info("EV-Radar starting (MODE=%s) ...", MODE)
+    try:
+        if MODE == "PROD":
             try:
-                minute = int(''.join(filter(str.isdigit, m["minute"])))
-            except:
-                minute = 0
-            if minute < 45 or minute > 80:
-                continue
+                matches = fetch_live_matches_prod()
+            except NotImplementedError as e:
+                logger.error("PROD fetch not implemented: %s", e)
+                logger.info("Falling back to DEMO mode.")
+                matches = fetch_live_matches_demo()
+        else:
+            matches = fetch_live_matches_demo()
 
-            key = f"{m['home']}-{m['away']}"
-            if key in sent:
-                continue
+        # sort by liquidity desc and cap to MAX_GAMES
+        matches = sorted(matches, key=lambda m: m.get("liquidity",0), reverse=True)[:MAX_GAMES]
 
-            odd = get_superbet_odds(m["home"], m["away"]) or FALLBACK_ODD
-            p_model = calc_p_model(m)
-            ev = calc_ev(p_model, odd)
+        output_rows = []
+        alerts_sent = 0
+        for m in matches:
+            ev = compute_ev_score(m)
+            decision_info = decide_action(m, ev)
+            m["ev_score"] = ev
+            m["decision"] = decision_info["decision"]
+            m["suggestion"] = decision_info["suggestion"]
 
-            log.info("%s x %s | %s | odd %.2f | EV %.3f", m["home"], m["away"], m["league"], odd, ev)
+            row = {
+                "league": m.get("league"),
+                "home": m.get("home"),
+                "away": m.get("away"),
+                "minute": m.get("minute"),
+                "score": m.get("score"),
+                "xg_total": m.get("xg_total"),
+                "sot": m.get("sot"),
+                "pressure": m.get("pressure"),
+                "odds_over25": m.get("odds_over25"),
+                "liquidity": m.get("liquidity"),
+                "ev_score": m.get("ev_score"),
+                "decision": m.get("decision"),
+                "suggestion": m.get("suggestion"),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            output_rows.append(row)
 
-            if ev >= EV_THRESHOLD:
-                msg = (
-                    f"🚨 *EV+ Detectado*\n"
-                    f"⚽ {m['league']} | {m['minute']}\n"
-                    f"*{m['home']}* – *{m['away']}*\n\n"
-                    f"*Over 2.5* @ *{odd:.2f}*\n"
-                    f"P_model: *{p_model:.3f}* | EV: *{ev:.3f}*\n"
-                    f"[Abrir no SofaScore]({m['url']})"
-                )
-                send_telegram_message(msg)
-                sent.add(key)
+            # alert if ENTER
+            if m.get("decision") == "ENTRAR":
+                msg = build_message(m)
+                ok = send_telegram(msg)
+                if ok:
+                    alerts_sent += 1
 
-        log.info("Ciclo completo, aguardando %d segundos...", POLL_INTERVAL)
-        time.sleep(POLL_INTERVAL)
+        # save CSV for Numbers / artifact
+        save_csv(output_rows)
+        logger.info("Processed %d matches. Alerts sent: %d", len(output_rows), alerts_sent)
+
+    except Exception as e:
+        logger.exception("Fatal error in main: %s", e)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
