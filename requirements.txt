@@ -2,3 +2,4 @@ Flask>=2.0
 python-telegram-bot==13.15
 requests
 gunicorn
+beautifulsoup4
