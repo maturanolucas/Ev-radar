@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# radar_bot.py
-# EV-Radar global — envia alertas Telegram / salva radar_ev.csv
-# Modo demo padrão: roda com dados de exemplo. Para produção, implemente fetch_live_matches_prod().
+# radar_bot.py — EV+ GLOBAL RADAR (multijogo, layout minimalista)
+# - Shows up to MAX_GAMES matches with potential (EV >= DISPLAY_THRESHOLD and odds >= ODD_MIN)
+# - Orders by EV desc then liquidity
+# - Sends a single minimalistic block to Telegram when at least one match qualifies
 
 import os
 import sys
 import csv
 import time
-import json
 import logging
 from datetime import datetime
 from typing import List, Dict, Any
@@ -18,10 +18,14 @@ import requests
 # ---------------------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-EV_THRESHOLD = int(os.getenv("EV_THRESHOLD", "65"))   # score >= this -> alert
-ODD_MIN = float(os.getenv("ODD_MIN", "1.50"))        # odd mínima aceitável
-MAX_GAMES = int(os.getenv("MAX_GAMES", "10"))
+ODDS_API_KEY = os.getenv("ODDS_API_KEY")  # optional, used in fetch_live_matches_prod
 MODE = os.getenv("MODE", "DEMO").upper()  # DEMO or PROD
+
+# thresholds
+EV_THRESHOLD = int(os.getenv("EV_THRESHOLD", "65"))       # threshold to "ENTRAR"
+DISPLAY_THRESHOLD = int(os.getenv("DISPLAY_THRESHOLD", "55"))  # threshold to show in block
+ODD_MIN = float(os.getenv("ODD_MIN", "1.50"))            # minimum acceptable odd to consider
+MAX_GAMES = int(os.getenv("MAX_GAMES", "10"))            # up to 10 matches displayed
 
 HEADERS = {"User-Agent": "EVRadarBot/1.0 (+https://your.project)"}
 
@@ -48,7 +52,7 @@ def send_telegram(text: str) -> bool:
         return False
 
 # ---------------------------
-# HELPERS: CSV save
+# SAVE CSV
 # ---------------------------
 def save_csv(rows: List[Dict[str, Any]], path: str = "radar_ev.csv") -> None:
     header = [
@@ -67,13 +71,9 @@ def save_csv(rows: List[Dict[str, Any]], path: str = "radar_ev.csv") -> None:
         logger.exception("Failed to save CSV: %s", e)
 
 # ---------------------------
-# EV model (replace weights with your tuned params)
+# EV model (same core as before)
 # ---------------------------
 def compute_ev_score(match: Dict[str, Any]) -> int:
-    """
-    Simple EV scoring combining multiple signals.
-    Returns integer 0..100.
-    """
     score = 0.0
     pressure = float(match.get("pressure", 50))  # 0..100
     xg = float(match.get("xg_total", 0.0))
@@ -86,108 +86,106 @@ def compute_ev_score(match: Dict[str, Any]) -> int:
     # xG mapping (0..3) -> up to 30 points
     score += min(xg / 3.0, 1.0) * 30.0
 
-    # SOT (shots on target) -> up to 20 points (10 SOT => full)
+    # SOT -> up to 20 points (10 SOT => full)
     score += min(sot / 10.0, 1.0) * 20.0
 
-    # Liquidity proxy bonus: scale small bonus so high-liquidity matches prioritized
-    # liquidity given in currency units — we normalize roughly (caps at +10)
+    # Liquidity proxy bonus -> up to 10
     try:
         score += min(liquidity / 3_000_000.0, 1.0) * 10.0
     except Exception:
         pass
 
-    # Context (placeholder fixed bonuses — swap for real checks)
-    # Example: motivation/home trailing; here simple static bonuses to reflect our heuristics
-    score += 6.0  # need/importance
-    score += 4.0  # historical tendency (should be replaced by real history)
+    # Context static placeholders (tunable)
+    score += 6.0  # importance/motivation baseline
+    score += 4.0  # historical tendency baseline
 
-    # Clamp and return integer
     score = max(0.0, min(100.0, score))
     return int(round(score))
 
 # ---------------------------
-# Decision logic
+# Decision
 # ---------------------------
 def decide_action(match: Dict[str, Any], ev_score: int) -> Dict[str,str]:
     dec = "IGNORAR"
     suggestion = "Sem stake"
-    if ev_score >= EV_THRESHOLD and float(match.get("odds_over25", 99)) >= ODD_MIN:
+    odd = match.get("odds_over25")
+    try:
+        odd_val = float(odd) if odd is not None else 0.0
+    except Exception:
+        odd_val = 0.0
+
+    if ev_score >= EV_THRESHOLD and odd_val >= ODD_MIN:
         dec = "ENTRAR"
-        suggestion = "Stake 1% (ajustar conforme banca)"
-    elif 55 <= ev_score < EV_THRESHOLD:
+        suggestion = "Stake 1% (ajustar)"
+    elif DISPLAY_THRESHOLD <= ev_score < EV_THRESHOLD:
         dec = "MONITORAR"
-        suggestion = "Aguardar confirmação"
+        suggestion = "Sem stake"
     else:
         dec = "IGNORAR"
         suggestion = "Sem stake"
     return {"decision": dec, "suggestion": suggestion}
 
 # ---------------------------
-# Message builder (minimalist visual)
+# Message builder: single minimal block with up to MAX_GAMES entries
 # ---------------------------
-def build_message(match: Dict[str,Any]) -> str:
-    league = match.get("league","")
-    home = match.get("home","")
-    away = match.get("away","")
-    minute = match.get("minute","")
-    score = match.get("score","")
-    xg = match.get("xg_total",0.0)
-    sot = match.get("sot",0)
-    pressure = match.get("pressure",0)
-    odds = match.get("odds_over25","N/A")
-    liquidity = match.get("liquidity",0)
-    ev = match.get("ev_score",0)
-    decision = match.get("decision","")
-    suggestion = match.get("suggestion","")
+def build_message_block(matches: List[Dict[str, Any]]) -> str:
+    header = "══════════ ⚽️ EV+ GLOBAL RADAR ══════════"
+    lines = [header]
+    # each match formatted in compact block
+    for i, m in enumerate(matches, start=1):
+        league = m.get("league", "")
+        home = m.get("home", "")
+        away = m.get("away", "")
+        minute = m.get("minute", "")
+        score = m.get("score", "")
+        xg = m.get("xg_total", "–")
+        sot = m.get("sot", "–")
+        pressure = m.get("pressure", "–")
+        odd = m.get("odds_over25", "N/A")
+        liq = m.get("liquidity", 0)
+        ev = m.get("ev_score", 0)
+        decision = m.get("decision", "IGNORAR")
+        suggestion = m.get("suggestion", "Sem stake")
 
-    lines = []
-    lines.append("══════════ ⚽️ EV+ GLOBAL RADAR ══════════")
-    lines.append(f"{league} — {home} {score} {away} | {minute}’")
-    lines.append(f"xG: {float(xg):.2f} | SOT: {sot} | Pressão: {pressure}%")
-    lines.append(f"Odd Over2.5: {odds} | Liquidez: £{int(liquidity):,}")
-    lines.append(f"SCORE EV+: {ev}/100 — {decision}")
-    lines.append(f"👉 Sugestão: {suggestion}")
+        # One match block (3 lines)
+        lines.append(f"#{i} {league} — {home} {score} {away} | {minute}’")
+        lines.append(f"xG: {float(xg) if isinstance(xg,(int,float)) else xg:.2f} | SOT: {sot} | Pressão: {pressure}%")
+        lines.append(f"Odd: {odd} | Liquidez: £{int(liq):,}")
+        lines.append(f"SCORE EV+: {ev}/100 — {decision}")
+        lines.append(f"👉 {suggestion}")
+        lines.append("")  # blank separator
+
     lines.append("════════════════════════════════════════")
     return "\n".join(lines)
 
 # ---------------------------
-# DATA PROVIDERS
+# Demo data provider
 # ---------------------------
-def fetch_live_matches_demo() -> List[Dict[str,Any]]:
-    """Returns demo static list (useful for testing)."""
+def fetch_live_matches_demo() -> List[Dict[str, Any]]:
     demo = [
-        {"id":"m1","league":"Serie A","home":"Inter","away":"Fiorentina","minute":65,"score":"1-0",
-         "xg_total":1.85,"sot":8,"pressure":74,"odds_over25":1.82,"liquidity":2900000},
-        {"id":"m2","league":"Ligue 1","home":"Marseille","away":"Angers","minute":74,"score":"2-1",
+        {"id":"m1","league":"Ligue 1","home":"Marseille","away":"Angers","minute":74,"score":"2-1",
          "xg_total":1.52,"sot":8,"pressure":77,"odds_over25":1.50,"liquidity":2300000},
-        {"id":"m3","league":"Premier League","home":"Liverpool","away":"Chelsea","minute":78,"score":"2-1",
-         "xg_total":3.05,"sot":12,"pressure":79,"odds_over25":1.44,"liquidity":4200000},
-        # add up to MAX_GAMES demo rows
+        {"id":"m2","league":"Serie A","home":"Inter","away":"Fiorentina","minute":65,"score":"1-0",
+         "xg_total":1.85,"sot":8,"pressure":74,"odds_over25":1.82,"liquidity":2900000},
+        {"id":"m3","league":"Copa Libertadores","home":"Racing","away":"Flamengo","minute":44,"score":"0-0",
+         "xg_total":0.46,"sot":3,"pressure":58,"odds_over25":1.68,"liquidity":280000},
+        # add more demo rows if needed
     ]
     return demo[:MAX_GAMES]
 
-# NOTE: Below is a placeholder function signature for production fetching.
-# Implement a real scraper or API client and return the same structure as DEMO.
-def fetch_live_matches_prod() -> List[Dict[str,Any]]:
+# ---------------------------
+# PRODUCTION: placeholder / integrate your fetch_live_matches_prod()
+# ---------------------------
+def fetch_live_matches_prod() -> List[Dict[str, Any]]:
     """
-    PRODUCTION: implement your Sofascore/Flashscore/odds provider integration here.
-    Important fields to return per match:
-      - id, league, home, away, minute, score
-      - xg_total (float), sot (int), pressure (0..100)
-      - odds_over25 (float), liquidity (numeric)
-    Example approaches:
-      - Call a public JSON endpoint (some sites expose /api/ endpoints) and parse fields.
-      - Scrape the live match page with requests + BeautifulSoup (use lxml parser).
-      - Use an odds API or aggregator to fetch odds and liquidity (requires accounts).
+    Replace this with your Sofascore + odds provider implementation.
+    Should return a list of dicts with the fields used in demo.
     """
-    # >>> EXAMPLE: pseudo-code (do not run)
-    # resp = requests.get("https://api.sofascore.com/api/v1/..." , headers=HEADERS, timeout=10)
-    # data = resp.json()
-    # parse data into list of match dicts...
-    raise NotImplementedError("Implement fetch_live_matches_prod() with your data source")
+    # The previously provided robust function can be pasted here.
+    raise NotImplementedError("Implement fetch_live_matches_prod() to fetch real live matches")
 
 # ---------------------------
-# MAIN
+# MAIN FLOW
 # ---------------------------
 def main():
     logger.info("EV-Radar starting (MODE=%s) ...", MODE)
@@ -197,54 +195,52 @@ def main():
                 matches = fetch_live_matches_prod()
             except NotImplementedError as e:
                 logger.error("PROD fetch not implemented: %s", e)
-                logger.info("Falling back to DEMO mode.")
+                logger.info("Falling back to DEMO")
                 matches = fetch_live_matches_demo()
         else:
             matches = fetch_live_matches_demo()
 
-        # sort by liquidity desc and cap to MAX_GAMES
-        matches = sorted(matches, key=lambda m: m.get("liquidity",0), reverse=True)[:MAX_GAMES]
-
-        output_rows = []
-        alerts_sent = 0
+        # compute EVs
+        processed = []
         for m in matches:
             ev = compute_ev_score(m)
-            decision_info = decide_action(m, ev)
             m["ev_score"] = ev
-            m["decision"] = decision_info["decision"]
-            m["suggestion"] = decision_info["suggestion"]
+            decinfo = decide_action(m, ev)
+            m["decision"] = decinfo["decision"]
+            m["suggestion"] = decinfo["suggestion"]
+            processed.append(m)
 
-            row = {
-                "league": m.get("league"),
-                "home": m.get("home"),
-                "away": m.get("away"),
-                "minute": m.get("minute"),
-                "score": m.get("score"),
-                "xg_total": m.get("xg_total"),
-                "sot": m.get("sot"),
-                "pressure": m.get("pressure"),
-                "odds_over25": m.get("odds_over25"),
-                "liquidity": m.get("liquidity"),
-                "ev_score": m.get("ev_score"),
-                "decision": m.get("decision"),
-                "suggestion": m.get("suggestion"),
-                "timestamp": datetime.utcnow().isoformat()
-            }
-            output_rows.append(row)
+        # filter: show only matches with EV >= DISPLAY_THRESHOLD and odds >= ODD_MIN
+        def valid_for_display(m):
+            try:
+                odd = float(m.get("odds_over25")) if m.get("odds_over25") is not None else 0.0
+            except Exception:
+                odd = 0.0
+            return (m.get("ev_score", 0) >= DISPLAY_THRESHOLD) and (odd >= ODD_MIN)
 
-            # alert if ENTER
-            if m.get("decision") == "ENTRAR":
-                msg = build_message(m)
-                ok = send_telegram(msg)
-                if ok:
-                    alerts_sent += 1
+        candidates = [m for m in processed if valid_for_display(m)]
 
-        # save CSV for Numbers / artifact
-        save_csv(output_rows)
-        logger.info("Processed %d matches. Alerts sent: %d", len(output_rows), alerts_sent)
+        # sort by ev desc then liquidity desc
+        candidates = sorted(candidates, key=lambda x: (x.get("ev_score",0), x.get("liquidity",0)), reverse=True)[:MAX_GAMES]
 
+        # If there are candidates, build block and send single message
+        if candidates:
+            # re-evaluate decisions for display: ENTAR if ev>=EV_THRESHOLD and odd>=ODD_MIN
+            for c in candidates:
+                ev = c.get("ev_score",0)
+                c.update(decide_action(c, ev))
+            # build single block
+            msg = build_message_block(candidates)
+            send_telegram(msg)
+        else:
+            logger.info("No candidates with EV >= %d and odd >= %.2f", DISPLAY_THRESHOLD, ODD_MIN)
+
+        # Save CSV with all processed (for record/Numbers)
+        save_csv(processed)
+
+        logger.info("Run complete. Candidates shown: %d", len(candidates))
     except Exception as e:
-        logger.exception("Fatal error in main: %s", e)
+        logger.exception("Fatal error: %s", e)
         sys.exit(1)
 
 if __name__ == "__main__":
